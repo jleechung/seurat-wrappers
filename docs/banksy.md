@@ -793,8 +793,9 @@ of the BANKSY matrix (default 50, matching Seurat’s `RunPCA`) directly
 via a sparse linear operator, and stores the result as a dimensionality
 reduction named by `assay_name`. No `BANKSY` assay is created, and there
 is no need to call `RunPCA` separately. For multi-sample integration,
-you can run Harmony on the BANKSY reduction before `FindNeighbors` (see
-the [Harmony section](#spatial-data-integration-with-harmony) above).
+you can run Harmony with `project.dim = FALSE` on the BANKSY reduction
+before `FindNeighbors` (see the [Harmony
+section](#spatial-data-integration-with-harmony) above).
 
 ``` r
 xenium_input <- xenium
@@ -804,7 +805,7 @@ xenium <- RunBanksy(xenium, lazy = TRUE, npcs = 50,
                     assay_name = 'BANKSY', verbose = TRUE)
 
 # Optionally, run Harmony for batch correction
-# xenium <- RunHarmony(xenium, group.by.vars = 'batch', reduction.use = 'BANKSY')
+# xenium <- RunHarmony(xenium, group.by.vars = 'batch', reduction.use = 'BANKSY', project.dim = FALSE)
 
 xenium <- FindNeighbors(xenium, reduction = 'BANKSY', dims = 1:50)
 xenium <- FindClusters(xenium, resolution = 0.5)
