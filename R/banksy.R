@@ -77,7 +77,7 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
                       assay_name='BANKSY', M=NULL, chunk_size=NULL,
                       parallel=FALSE, num_cores=NULL,
                       lazy=FALSE, npcs=50L, scale_max=10,
-                      pca_backend=c("cpp", "r"),
+                      pca_backend=c("cpp", "r", "bpcells"),
                       verbose=TRUE) {
     # Check packages
     SeuratWrappers:::CheckPackage(package = 'data.table', repository = 'CRAN')
@@ -97,12 +97,17 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
     if (lazy && !is.null(group)) {
         locs <- get_locs(object, dimx, dimy, dimz, ndim, data_own,
                          group = NULL, verbose)
-        stag <- get_locs(object, dimx, dimy, dimz, ndim, data_own,
-                         group, verbose)
+        groups_vec <- unlist(object[[group]])
+
+        # Derive the staggered frame from locs instead of rebuilding it. The
+        # staggered copy is a plotting convenience -- per-group kNN runs on the
+        # unstaggered coordinates -- so recomputing the whole frame, and then
+        # holding both through the kNN, cost two extra n x ndim doubles for
+        # nothing. That is ~32 GB of transient at 1B cells.
+        stag <- .stagger_locs(locs, groups_vec, group, verbose)
         object <- AddMetaData(object, metadata = stag,
                               col.name = paste0('staggered_', colnames(stag)))
-
-        groups_vec <- unlist(object[[group]])
+        rm(stag)
         ugroups <- unique(groups_vec)
         group_idx <- lapply(ugroups, function(g) which(g == groups_vec))
 
@@ -114,6 +119,7 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
 
         group_locs <- lapply(group_idx, function(cid) locs[cid, , drop = FALSE])
 
+        # The lazy core never reads phi
         if (!is.null(num_cores) && num_cores > 1L) {
             if (verbose) message('  Parallel kNN: mclapply (', num_cores, ' cores)')
             group_knn <- parallel::mclapply(group_locs,
@@ -123,7 +129,7 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
                             loc_slice, spatial_mode = spatial_mode,
                             k_geom = kg, n = n, sigma = sigma,
                             alpha = alpha, k_spatial = k_spatial,
-                            verbose = FALSE))
+                            verbose = FALSE, compute_phi = FALSE))
                 }, mc.cores = num_cores)
         } else {
             group_knn <- lapply(group_locs,
@@ -132,11 +138,12 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
                         Banksy:::computeNeighbors(
                             loc_slice, spatial_mode = spatial_mode, k_geom = kg,
                             n = n, sigma = sigma, alpha = alpha,
-                            k_spatial = k_spatial, verbose = FALSE))
+                            k_spatial = k_spatial, verbose = FALSE,
+                            compute_phi = FALSE))
                 })
         }
         rm(group_locs)
-        rm(locs, stag); gc(verbose = FALSE)
+        rm(locs); gc(verbose = FALSE)
 
         pca_result <- Banksy:::.banksy_lazy_pca_core(
             data_own,
@@ -145,6 +152,7 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
             split_scale = split.scale,
             scale_max = scale_max,
             pca_backend = pca_backend,
+            num_cores = num_cores,
             verbose = verbose)
         object <- .store_lazy_result(object, pca_result, assay, assay_name, npcs)
         rm(data_own, group_knn, pca_result)
@@ -156,11 +164,13 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
                 col.name = paste0('staggered_', colnames(locs)))
         }
 
+        # .banksy_standard does read phi
         knn_list <- lapply(k_geom, function(kg) {
           Banksy:::computeNeighbors(locs,
                                     spatial_mode = spatial_mode, k_geom = kg,
                                     n = n, sigma = sigma, alpha = alpha,
-                                    k_spatial = k_spatial, verbose = verbose)
+                                    k_spatial = k_spatial, verbose = verbose,
+                                    compute_phi = !lazy)
         })
 
         if (!lazy && nrow(data_own) * ncol(data_own) > 1e8) {
@@ -177,6 +187,7 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
                 split_scale = !is.null(group) && split.scale,
                 scale_max = scale_max,
                 pca_backend = pca_backend,
+                num_cores = num_cores,
                 verbose = verbose)
             object <- .store_lazy_result(object, pca_result, assay, assay_name, npcs)
             rm(data_own, knn_list, pca_result)
@@ -323,19 +334,25 @@ get_locs <- function(object, dimx, dimy, dimz, ndim, data_own, group, verbose) {
     colnames(locs) <- dim_names[seq_len(ncol(locs))]
 
     if (!is.null(group)) {
-        # Stagger locations by group
-        if (verbose) message('Staggering locations by ', group)
-        locs[,1] = locs[,1] + abs(min(locs[,1]))
-        max_x = max(locs[,1]) * 2
-        groups_vec <- unlist(object[[group]])
-        ugroups <- unique(groups_vec)
-        shift <- setNames(
-            seq(from = 0, length.out = length(ugroups), by = max_x),
-            ugroups)
-        locs[, 1] = locs[, 1] + shift[groups_vec]
+        locs <- .stagger_locs(locs, unlist(object[[group]]), group, verbose)
     }
 
     return(locs)
+}
+
+# Shift each group along x so groups do not overlap spatially. Factored out of
+# get_locs so the lazy per-group path can stagger the coordinate frame it has
+# already built rather than computing a second one.
+.stagger_locs <- function(locs, groups_vec, group, verbose) {
+    if (verbose) message('Staggering locations by ', group)
+    locs[, 1] <- locs[, 1] + abs(min(locs[, 1]))
+    max_x <- max(locs[, 1]) * 2
+    ugroups <- unique(groups_vec)
+    shift <- setNames(
+        seq(from = 0, length.out = length(ugroups), by = max_x),
+        ugroups)
+    locs[, 1] <- locs[, 1] + shift[groups_vec]
+    locs
 }
 
 # Scaling
