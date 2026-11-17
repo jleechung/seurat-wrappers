@@ -758,11 +758,14 @@ held in memory.
 filter). When `group` is specified, `split.scale=TRUE` applies
 within-group scaling in the lazy workflow as in the standard workflow.
 
-This feature requires the development version of Banksy:
+Lazy PCA requires the development version of Banksy.
 
 ``` r
 devtools::install_github('prabhakarlab/Banksy')
 ```
+
+The million-cell benchmark uses the `feat-scaling` branches of Banksy and
+SeuratWrappers. These branches add parallel reads of BPCells matrices by group.
 
 We demonstrate this with a 10X Xenium mouse brain dataset (~37k cells),
 performing domain segmentation with `lambda = 0.8`.
@@ -842,7 +845,7 @@ Equivalence with the standard workflow
 The standard workflow constructs the full BANKSY matrix `M` by
 vertically stacking the z-scored expression matrix and the z-scored
 neighborhood-smoothed matrix (weighted by `lambda`), where z-scoring
-includes clipping to \[-10, 10\] to match Seurat’s `FastRowScale`. PCA
+caps values above 10 to match Seurat’s `FastRowScale`. PCA
 is then computed on `M` via `RunPCA`.
 
 With `lazy=TRUE`, `M` is never formed. Instead, `irlba` accesses `M`

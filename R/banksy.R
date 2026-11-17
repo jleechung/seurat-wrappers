@@ -42,18 +42,20 @@ NULL
 #' @param parallel A logical scalar specifying whether to compute chunks in
 #'   parallel using bplapply. Not implemented for Windows.
 #' @param num_cores A integer scalar specifying the number of cores to use
-#'   if parallel is TRUE.
+#'   if parallel is TRUE. In lazy mode, this controls per-group neighbor
+#'   computation and, when supported by Banksy, disk-backed matrix reads.
 #' @param lazy (boolean) If TRUE, compute PCA directly without materializing
 #'   the full BANKSY matrix. Enables analysis of very large datasets (millions
 #'   of cells) that would otherwise exceed available memory. Currently only
 #'   supported for M=0 (no AGF). Supports within-group scaling with
 #'   \code{split.scale=TRUE}. Requires the irlba package.
 #' @param npcs (integer) Number of PCs to compute when lazy=TRUE (default 50)
-#' @param scale_max (numeric) Maximum absolute z-score for clipping when
-#'   lazy=TRUE. Matches Seurat's FastRowScale default of 10.
+#' @param scale_max (numeric) Upper cap for z-scores when lazy=TRUE.
+#'   Matches Seurat's FastRowScale default of 10.
 #' @param pca_backend (character) Backend for PCA computation when lazy=TRUE.
 #'   'cpp' (default) uses C++ irlba for lower memory and faster runtime.
-#'   'r' uses R's irlba package.
+#'   'r' uses R's irlba package. 'bpcells' requires a Banksy build with
+#'   the experimental BPCells SVD backend.
 #' @param verbose (boolean) Print messages
 #'
 #' @return A Seurat object. If lazy=FALSE, contains a new assay holding the
@@ -92,6 +94,30 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
 
     # Resolve harmonics
     M <- seq(0, max(Banksy:::getM(use_agf, M)))
+    if (lazy && (use_agf || max(M) > 0L)) {
+        stop("lazy=TRUE only supports M=0 (no AGF). Use lazy=FALSE for AGF")
+    }
+
+    compute_neighbors <- Banksy:::computeNeighbors
+    neighbor_args <- list(spatial_mode = spatial_mode, n = n, sigma = sigma,
+                          alpha = alpha, k_spatial = k_spatial)
+    if (lazy && 'compute_phi' %in% names(formals(compute_neighbors))) {
+        neighbor_args$compute_phi <- FALSE
+    }
+    get_neighbors <- function(locs, verbose) {
+        lapply(k_geom, function(kg) do.call(compute_neighbors,
+            c(list(locs = locs, k_geom = kg, verbose = verbose), neighbor_args)))
+    }
+
+    if (lazy) {
+        pca_backend <- match.arg(pca_backend)
+        lazy_pca <- Banksy:::.banksy_lazy_pca_core
+        pca_args <- list(lambda = lambda, npcs = npcs, scale_max = scale_max,
+                         pca_backend = pca_backend, verbose = verbose)
+        if ('num_cores' %in% names(formals(lazy_pca))) {
+            pca_args$num_cores <- num_cores
+        }
+    }
 
     # Per-group lazy path: kNN per group on raw coordinates
     if (lazy && !is.null(group)) {
@@ -99,11 +125,7 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
                          group = NULL, verbose)
         groups_vec <- unlist(object[[group]])
 
-        # Derive the staggered frame from locs instead of rebuilding it. The
-        # staggered copy is a plotting convenience -- per-group kNN runs on the
-        # unstaggered coordinates -- so recomputing the whole frame, and then
-        # holding both through the kNN, cost two extra n x ndim doubles for
-        # nothing. That is ~32 GB of transient at 1B cells.
+        # Stagger coordinates for plotting only.
         stag <- .stagger_locs(locs, groups_vec, group, verbose)
         object <- AddMetaData(object, metadata = stag,
                               col.name = paste0('staggered_', colnames(stag)))
@@ -119,41 +141,19 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
 
         group_locs <- lapply(group_idx, function(cid) locs[cid, , drop = FALSE])
 
-        # The lazy core never reads phi
-        if (!is.null(num_cores) && num_cores > 1L) {
+        if (!is.null(num_cores) && num_cores > 1L &&
+            .Platform$OS.type != 'windows') {
             if (verbose) message('  Parallel kNN: mclapply (', num_cores, ' cores)')
-            group_knn <- parallel::mclapply(group_locs,
-                function(loc_slice) {
-                    lapply(k_geom, function(kg)
-                        Banksy:::computeNeighbors(
-                            loc_slice, spatial_mode = spatial_mode,
-                            k_geom = kg, n = n, sigma = sigma,
-                            alpha = alpha, k_spatial = k_spatial,
-                            verbose = FALSE, compute_phi = FALSE))
-                }, mc.cores = num_cores)
+            group_knn <- parallel::mclapply(group_locs, get_neighbors,
+                verbose = FALSE, mc.cores = num_cores)
         } else {
-            group_knn <- lapply(group_locs,
-                function(loc_slice) {
-                    lapply(k_geom, function(kg)
-                        Banksy:::computeNeighbors(
-                            loc_slice, spatial_mode = spatial_mode, k_geom = kg,
-                            n = n, sigma = sigma, alpha = alpha,
-                            k_spatial = k_spatial, verbose = FALSE,
-                            compute_phi = FALSE))
-                })
+            group_knn <- lapply(group_locs, get_neighbors, verbose = FALSE)
         }
-        rm(group_locs)
-        rm(locs); gc(verbose = FALSE)
+        rm(group_locs, locs); gc(verbose = FALSE)
 
-        pca_result <- Banksy:::.banksy_lazy_pca_core(
-            data_own,
-            group_knn = group_knn, group_idx = group_idx,
-            lambda = lambda, npcs = npcs,
-            split_scale = split.scale,
-            scale_max = scale_max,
-            pca_backend = pca_backend,
-            num_cores = num_cores,
-            verbose = verbose)
+        pca_result <- do.call(lazy_pca,
+            c(list(data_own = data_own, group_knn = group_knn,
+                   group_idx = group_idx, split_scale = split.scale), pca_args))
         object <- .store_lazy_result(object, pca_result, assay, assay_name, npcs)
         rm(data_own, group_knn, pca_result)
     } else {
@@ -164,14 +164,7 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
                 col.name = paste0('staggered_', colnames(locs)))
         }
 
-        # .banksy_standard does read phi
-        knn_list <- lapply(k_geom, function(kg) {
-          Banksy:::computeNeighbors(locs,
-                                    spatial_mode = spatial_mode, k_geom = kg,
-                                    n = n, sigma = sigma, alpha = alpha,
-                                    k_spatial = k_spatial, verbose = verbose,
-                                    compute_phi = !lazy)
-        })
+        knn_list <- get_neighbors(locs, verbose)
 
         if (!lazy && nrow(data_own) * ncol(data_own) > 1e8) {
             message('Note: dataset is large (', nrow(data_own), ' features x ',
@@ -180,15 +173,8 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
         }
 
         if (lazy) {
-            pca_result <- Banksy:::.banksy_lazy_pca_core(
-                data_own,
-                knn_list = knn_list,
-                lambda = lambda, npcs = npcs,
-                split_scale = !is.null(group) && split.scale,
-                scale_max = scale_max,
-                pca_backend = pca_backend,
-                num_cores = num_cores,
-                verbose = verbose)
+            pca_result <- do.call(lazy_pca,
+                c(list(data_own = data_own, knn_list = knn_list), pca_args))
             object <- .store_lazy_result(object, pca_result, assay, assay_name, npcs)
             rm(data_own, knn_list, pca_result)
         } else {

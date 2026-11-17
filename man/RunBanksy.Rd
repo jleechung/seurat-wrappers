@@ -31,6 +31,7 @@ RunBanksy(
   lazy = FALSE,
   npcs = 50L,
   scale_max = 10,
+  pca_backend = c("cpp", "r", "bpcells"),
   verbose = TRUE
 )
 }
@@ -94,7 +95,8 @@ specified.}
 parallel using bplapply. Not implemented for Windows.}
 
 \item{num_cores}{A integer scalar specifying the number of cores to use
-if parallel is TRUE.}
+if parallel is TRUE. In lazy mode, this controls per-group neighbor
+computation and, when supported by Banksy, disk-backed matrix reads.}
 
 \item{lazy}{(boolean) If TRUE, compute PCA directly without materializing
 the full BANKSY matrix. Enables analysis of very large datasets (millions
@@ -104,8 +106,12 @@ supported for M=0 (no AGF). Supports within-group scaling with
 
 \item{npcs}{(integer) Number of PCs to compute when lazy=TRUE (default 50)}
 
-\item{scale_max}{(numeric) Maximum absolute z-score for clipping when
+\item{scale_max}{(numeric) Upper cap for z-scores when
 lazy=TRUE. Matches Seurat's FastRowScale default of 10.}
+
+\item{pca_backend}{(character) Backend for lazy PCA.
+'cpp' (default) uses the C++ solver and 'r' uses irlba.
+'bpcells' requires a Banksy build with the experimental BPCells SVD backend.}
 
 \item{verbose}{(boolean) Print messages}
 }
