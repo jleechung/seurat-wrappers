@@ -25,12 +25,12 @@ NULL
 #' @param k_spatial (numeric) rNN parameter - number of neighbors to use
 #' @param spatial_mode (character) Kernel for neighborhood computation
 #' \itemize{
-#'  \item{kNN_median: k-nearest neighbors with median-scaled Gaussian kernel}
-#'  \item{kNN_r: k-nearest neighbors with $1/r$ kernel}
-#'  \item{kNN_rn: k-nearest neighbors with $1/r^n$ kernel}
-#'  \item{kNN_rank: k-nearest neighbors with rank Gaussian kernel}
-#'  \item{kNN_unif: k-nearest neighbors wth uniform kernel}
-#'  \item{rNN_gauss: radial nearest neighbors with Gaussian kernel}
+#'  \item \code{kNN_median} uses a median-scaled Gaussian kernel.
+#'  \item \code{kNN_r} uses a \eqn{1/r} kernel.
+#'  \item \code{kNN_rn} uses a \eqn{1/r^n} kernel.
+#'  \item \code{kNN_rank} uses a Gaussian kernel based on neighbor rank.
+#'  \item \code{kNN_unif} uses a uniform kernel.
+#'  \item \code{rNN_gauss} uses a Gaussian kernel for neighbors within a radius.
 #' }
 #' @param assay_name (character) Name for output. When lazy=FALSE, names the
 #'   BANKSY assay. When lazy=TRUE, names the dimensionality reduction.
@@ -41,9 +41,10 @@ NULL
 #'   specified.
 #' @param parallel A logical scalar specifying whether to compute chunks in
 #'   parallel using bplapply. Not implemented for Windows.
-#' @param num_cores A integer scalar specifying the number of cores to use
+#' @param num_cores An integer scalar specifying the number of cores to use
 #'   if parallel is TRUE. In lazy mode, this controls per-group neighbor
 #'   computation and, when supported by Banksy, disk-backed matrix reads.
+#'   Gram PCA in Seurat processes groups sequentially.
 #' @param lazy (boolean) If TRUE, compute PCA directly without materializing
 #'   the full BANKSY matrix. Enables analysis of very large datasets (millions
 #'   of cells) that would otherwise exceed available memory. Currently only
@@ -54,15 +55,23 @@ NULL
 #'   Matches Seurat's FastRowScale default of 10.
 #' @param pca_backend (character) Backend for PCA computation when lazy=TRUE.
 #'   'cpp' (default) uses C++ irlba for lower memory and faster runtime.
-#'   'r' uses R's irlba package. 'bpcells' requires a Banksy build with
-#'   the experimental BPCells SVD backend.
+#'   'r' uses R's irlba package.
+#'   'bpcells' uses the experimental BPCells SVD and accepts expression
+#'   in memory or on disk.
+#'   'gram' computes PCA from the feature Gram matrix and returns scores in memory.
 #' @param verbose (boolean) Print messages
+#' @param device The compute device for lazy PCA. Use \code{"cpu"} (default)
+#'   or \code{"cuda"}. CUDA accelerates sparse matrix products for grouped
+#'   \code{"cpp"} runs. Set \code{BANKSY_CUSPARSE_LIB} to the library path.
+#'   For \code{"gram"}, CUDA accelerates Gram accumulation, eigendecomposition,
+#'   and capped score projection. Set \code{BANKSY_GRAM_CUDA_LIB} to the library path.
+#'   Gram PCA and CUDA require a Banksy build that supports those options.
 #'
 #' @return A Seurat object. If lazy=FALSE, contains a new assay holding the
 #'   BANKSY matrix. If lazy=TRUE, contains a dimensionality reduction named
 #'   by assay_name with PCA embeddings computed on the BANKSY matrix.
 #'
-#' @seealso \code{\link[Banksy]{ComputeBanksy}}
+#' @seealso \code{\link[Banksy]{computeBanksy}}
 #'
 #' @author Joseph Lee, Vipul Singhal
 #'
@@ -79,8 +88,8 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
                       assay_name='BANKSY', M=NULL, chunk_size=NULL,
                       parallel=FALSE, num_cores=NULL,
                       lazy=FALSE, npcs=50L, scale_max=10,
-                      pca_backend=c("cpp", "r", "bpcells"),
-                      verbose=TRUE) {
+                      pca_backend=c("cpp", "r", "bpcells", "gram"),
+                      verbose=TRUE, device=c("cpu", "cuda")) {
     # Check packages
     SeuratWrappers:::CheckPackage(package = 'data.table', repository = 'CRAN')
     SeuratWrappers:::CheckPackage(package = 'Matrix', repository = 'CRAN')
@@ -89,6 +98,8 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
     # Check lambda param
     if (lambda < 0 || lambda > 1) stop('Lambda must be between 0 and 1')
 
+    device <- match.arg(device)
+    if (!lazy && device == 'cuda') stop('CUDA requires lazy = TRUE')
     # Get data
     data_own <- get_data(object, assay, slot, features, verbose)
 
@@ -111,25 +122,52 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
 
     if (lazy) {
         pca_backend <- match.arg(pca_backend)
-        lazy_pca <- Banksy:::.banksy_lazy_pca_core
-        pca_args <- list(lambda = lambda, npcs = npcs, scale_max = scale_max,
-                         pca_backend = pca_backend, verbose = verbose)
-        if ('num_cores' %in% names(formals(lazy_pca))) {
-            pca_args$num_cores <- num_cores
+        if (device == 'cuda' && !pca_backend %in% c('cpp', 'gram'))
+            stop("CUDA requires pca_backend = 'cpp' or 'gram'")
+
+        if (pca_backend == 'gram') {
+            gram_solver <- get0('.runBanksyGram', envir = asNamespace('Banksy'),
+                                mode = 'function', inherits = FALSE)
+            if (is.null(gram_solver))
+                stop("Gram PCA requires a Banksy build with Gram support")
+        } else {
+            lazy_pca <- Banksy:::.banksy_lazy_pca_core
+            pca_args <- list(lambda = lambda, npcs = npcs, scale_max = scale_max,
+                             pca_backend = pca_backend, verbose = verbose)
+            if ('num_cores' %in% names(formals(lazy_pca))) {
+                pca_args$num_cores <- num_cores
+            }
+            if ('device' %in% names(formals(lazy_pca))) {
+                pca_args$device <- device
+            } else if (device == 'cuda') {
+                stop('CUDA requires a Banksy build with device support')
+            }
         }
+    }
+
+    locs <- get_locs(object, dimx, dimy, dimz, ndim, data_own,
+                     group = if (lazy) NULL else group, verbose)
+    groups_vec <- if (lazy && !is.null(group)) unlist(object[[group]])
+    if (!is.null(group) && (!lazy || pca_backend != 'gram' || !is.null(groups_vec))) {
+        stag <- if (lazy) .stagger_locs(locs, groups_vec, group, verbose) else locs
+        object <- AddMetaData(object, metadata = stag,
+                              col.name = paste0('staggered_', colnames(stag)))
+        rm(stag)
+    }
+
+    if (lazy && pca_backend == 'gram') {
+        gram <- do.call(gram_solver,
+            c(list(data = data_own, coordinates = locs, group = groups_vec,
+                   lambda = lambda, npcs = npcs, split_scale = split.scale,
+                   scale_max = scale_max, k_geom = k_geom, verbose = verbose,
+                   device = device),
+              neighbor_args[names(neighbor_args) != 'compute_phi']))
+        object <- .store_lazy_result(object, gram$fits[[1L]], assay, assay_name, npcs)
+        return(Seurat::LogSeuratCommand(object = object))
     }
 
     # Per-group lazy path: kNN per group on raw coordinates
     if (lazy && !is.null(group)) {
-        locs <- get_locs(object, dimx, dimy, dimz, ndim, data_own,
-                         group = NULL, verbose)
-        groups_vec <- unlist(object[[group]])
-
-        # Stagger coordinates for plotting only.
-        stag <- .stagger_locs(locs, groups_vec, group, verbose)
-        object <- AddMetaData(object, metadata = stag,
-                              col.name = paste0('staggered_', colnames(stag)))
-        rm(stag)
         ugroups <- unique(groups_vec)
         group_idx <- lapply(ugroups, function(g) which(g == groups_vec))
 
@@ -157,13 +195,6 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
         object <- .store_lazy_result(object, pca_result, assay, assay_name, npcs)
         rm(data_own, group_knn, pca_result)
     } else {
-        locs <- get_locs(object, dimx, dimy, dimz, ndim, data_own, group, verbose)
-        if (!is.null(group)) {
-            object <- AddMetaData(
-                object, metadata = locs,
-                col.name = paste0('staggered_', colnames(locs)))
-        }
-
         knn_list <- get_neighbors(locs, verbose)
 
         if (!lazy && nrow(data_own) * ncol(data_own) > 1e8) {

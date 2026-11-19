@@ -31,8 +31,9 @@ RunBanksy(
   lazy = FALSE,
   npcs = 50L,
   scale_max = 10,
-  pca_backend = c("cpp", "r", "bpcells"),
-  verbose = TRUE
+  pca_backend = c("cpp", "r", "bpcells", "gram"),
+  verbose = TRUE,
+  device = c("cpu", "cuda")
 )
 }
 \arguments{
@@ -73,12 +74,12 @@ a vector of feature names}
 
 \item{spatial_mode}{(character) Kernel for neighborhood computation
 \itemize{
- \item{kNN_median: k-nearest neighbors with median-scaled Gaussian kernel}
- \item{kNN_r: k-nearest neighbors with $1/r$ kernel}
- \item{kNN_rn: k-nearest neighbors with $1/r^n$ kernel}
- \item{kNN_rank: k-nearest neighbors with rank Gaussian kernel}
- \item{kNN_unif: k-nearest neighbors wth uniform kernel}
- \item{rNN_gauss: radial nearest neighbors with Gaussian kernel}
+ \item \code{kNN_median} uses a median-scaled Gaussian kernel.
+ \item \code{kNN_r} uses a \eqn{1/r} kernel.
+ \item \code{kNN_rn} uses a \eqn{1/r^n} kernel.
+ \item \code{kNN_rank} uses a Gaussian kernel based on neighbor rank.
+ \item \code{kNN_unif} uses a uniform kernel.
+ \item \code{rNN_gauss} uses a Gaussian kernel for neighbors within a radius.
 }}
 
 \item{assay_name}{(character) Name for output. When lazy=FALSE, names the
@@ -94,9 +95,10 @@ specified.}
 \item{parallel}{A logical scalar specifying whether to compute chunks in
 parallel using bplapply. Not implemented for Windows.}
 
-\item{num_cores}{A integer scalar specifying the number of cores to use
+\item{num_cores}{An integer scalar specifying the number of cores to use
 if parallel is TRUE. In lazy mode, this controls per-group neighbor
-computation and, when supported by Banksy, disk-backed matrix reads.}
+computation and, when supported by Banksy, disk-backed matrix reads.
+Gram PCA in Seurat processes groups sequentially.}
 
 \item{lazy}{(boolean) If TRUE, compute PCA directly without materializing
 the full BANKSY matrix. Enables analysis of very large datasets (millions
@@ -106,14 +108,24 @@ supported for M=0 (no AGF). Supports within-group scaling with
 
 \item{npcs}{(integer) Number of PCs to compute when lazy=TRUE (default 50)}
 
-\item{scale_max}{(numeric) Upper cap for z-scores when
-lazy=TRUE. Matches Seurat's FastRowScale default of 10.}
+\item{scale_max}{(numeric) Upper cap for z-scores when lazy=TRUE.
+Matches Seurat's FastRowScale default of 10.}
 
-\item{pca_backend}{(character) Backend for lazy PCA.
-'cpp' (default) uses the C++ solver and 'r' uses irlba.
-'bpcells' requires a Banksy build with the experimental BPCells SVD backend.}
+\item{pca_backend}{(character) Backend for PCA computation when lazy=TRUE.
+'cpp' (default) uses C++ irlba for lower memory and faster runtime.
+'r' uses R's irlba package.
+'bpcells' uses the experimental BPCells SVD and accepts expression
+in memory or on disk.
+'gram' computes PCA from the feature Gram matrix and returns scores in memory.}
 
 \item{verbose}{(boolean) Print messages}
+
+\item{device}{The compute device for lazy PCA. Use \code{"cpu"} (default)
+or \code{"cuda"}. CUDA accelerates sparse matrix products for grouped
+\code{"cpp"} runs. Set \code{BANKSY_CUSPARSE_LIB} to the library path.
+For \code{"gram"}, CUDA accelerates Gram accumulation, eigendecomposition,
+and capped score projection. Set \code{BANKSY_GRAM_CUDA_LIB} to the library path.
+Gram PCA and CUDA require a Banksy build that supports those options.}
 }
 \value{
 A Seurat object. If lazy=FALSE, contains a new assay holding the
@@ -128,7 +140,7 @@ Vipul Singhal, Nigel Chou et. al. BANKSY: A Spatial Omics
 Algorithm that Unifies Cell Type Clustering and Tissue Domain Segmentation
 }
 \seealso{
-\code{\link[Banksy]{ComputeBanksy}}
+\code{\link[Banksy]{computeBanksy}}
 }
 \author{
 Joseph Lee, Vipul Singhal
