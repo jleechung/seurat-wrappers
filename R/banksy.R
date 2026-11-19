@@ -44,7 +44,8 @@ NULL
 #' @param num_cores An integer scalar specifying the number of cores to use
 #'   if parallel is TRUE. In lazy mode, this controls per-group neighbor
 #'   computation and, when supported by Banksy, disk-backed matrix reads.
-#'   Gram PCA in Seurat processes groups sequentially.
+#'   CUDA Gram PCA with disk-backed input defaults to up to eight sample
+#'   workers, limited by the available cores and number of groups.
 #' @param lazy (boolean) If TRUE, compute PCA directly without materializing
 #'   the full BANKSY matrix. Enables analysis of very large datasets (millions
 #'   of cells) that would otherwise exceed available memory. Currently only
@@ -63,8 +64,9 @@ NULL
 #' @param device The compute device for lazy PCA. Use \code{"cpu"} (default)
 #'   or \code{"cuda"}. CUDA accelerates sparse matrix products for grouped
 #'   \code{"cpp"} runs. Set \code{BANKSY_CUSPARSE_LIB} to the library path.
-#'   For \code{"gram"}, CUDA accelerates Gram accumulation, eigendecomposition,
-#'   and capped score projection. Set \code{BANKSY_GRAM_CUDA_LIB} to the library path.
+#'   For \code{"gram"}, CUDA accelerates Gram accumulation and eigendecomposition.
+#'   With capped scaling, it can also accelerate score projection and split scaling.
+#'   Set \code{BANKSY_GRAM_CUDA_LIB} to the library path.
 #'   Gram PCA and CUDA require a Banksy build that supports those options.
 #'
 #' @return A Seurat object. If lazy=FALSE, contains a new assay holding the
@@ -115,7 +117,13 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
     if (lazy && 'compute_phi' %in% names(formals(compute_neighbors))) {
         neighbor_args$compute_phi <- FALSE
     }
-    get_neighbors <- function(locs, verbose) {
+    median_weights <- if (lazy && spatial_mode == 'kNN_median') {
+        get0('.medianWeightMatrix', envir = asNamespace('Banksy'),
+             mode = 'function', inherits = FALSE)
+    }
+    get_neighbors <- function(locs, verbose, threaded = TRUE) {
+        if (is.function(median_weights))
+            return(lapply(k_geom, function(kg) median_weights(locs, kg, threaded)))
         lapply(k_geom, function(kg) do.call(compute_neighbors,
             c(list(locs = locs, k_geom = kg, verbose = verbose), neighbor_args)))
     }
@@ -156,12 +164,19 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
     }
 
     if (lazy && pca_backend == 'gram') {
+        gram_args <- if ('parallel_bpcells' %in% names(formals(gram_solver))) {
+            list(parallel_bpcells = device == 'cuda',
+                 workers = if (device == 'cuda') num_cores, gpu_scaling = TRUE)
+        }
+        if (spatial_mode != 'kNN_median') {
+            gram_args <- c(gram_args, neighbor_args[c('n', 'sigma', 'alpha', 'k_spatial')])
+        }
         gram <- do.call(gram_solver,
             c(list(data = data_own, coordinates = locs, group = groups_vec,
                    lambda = lambda, npcs = npcs, split_scale = split.scale,
                    scale_max = scale_max, k_geom = k_geom, verbose = verbose,
-                   device = device),
-              neighbor_args[names(neighbor_args) != 'compute_phi']))
+                   device = device, spatial_mode = spatial_mode),
+              gram_args))
         object <- .store_lazy_result(object, gram$fits[[1L]], assay, assay_name, npcs)
         return(Seurat::LogSeuratCommand(object = object))
     }
@@ -169,7 +184,11 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
     # Per-group lazy path: kNN per group on raw coordinates
     if (lazy && !is.null(group)) {
         ugroups <- unique(groups_vec)
-        group_idx <- lapply(ugroups, function(g) which(g == groups_vec))
+        group_idx <- if (anyNA(groups_vec)) {
+            lapply(ugroups, function(g) which(g == groups_vec))
+        } else {
+            unname(split(seq_along(groups_vec), match(groups_vec, ugroups)))
+        }
 
         if (verbose) {
             message('Computing per-group neighbors')
@@ -183,7 +202,7 @@ RunBanksy <- function(object, lambda, assay='RNA', slot='data', use_agf=FALSE,
             .Platform$OS.type != 'windows') {
             if (verbose) message('  Parallel kNN: mclapply (', num_cores, ' cores)')
             group_knn <- parallel::mclapply(group_locs, get_neighbors,
-                verbose = FALSE, mc.cores = num_cores)
+                verbose = FALSE, threaded = FALSE, mc.cores = num_cores)
         } else {
             group_knn <- lapply(group_locs, get_neighbors, verbose = FALSE)
         }
@@ -334,13 +353,15 @@ get_locs <- function(object, dimx, dimy, dimz, ndim, data_own, group, verbose) {
         # Check locations
         obj_samples <- colnames(data_own)
         locs_samples <- rownames(locs)
-        if (any(is.na(match(obj_samples, locs_samples)))) {
-            na_id <- which(is.na(match(obj_samples, locs_samples)))
-            warning('No centroids found for samples: ',
-                    paste(obj_samples[na_id], collapse = ', '), '. Dropping samples.')
-            data_own <- data_own[, -na_id, drop = FALSE]
+        if (!identical(obj_samples, locs_samples)) {
+            loc_idx <- match(obj_samples, locs_samples)
+            if (anyNA(loc_idx)) {
+                warning('No centroids found for samples: ',
+                        paste(obj_samples[is.na(loc_idx)], collapse = ', '),
+                        '. Dropping samples.')
+            }
+            locs <- locs[loc_idx, , drop = FALSE]
         }
-        locs <- locs[match(obj_samples, locs_samples),,drop=FALSE]
 
     } else {
         # Extract locations with Seurat accessor

@@ -98,7 +98,8 @@ parallel using bplapply. Not implemented for Windows.}
 \item{num_cores}{An integer scalar specifying the number of cores to use
 if parallel is TRUE. In lazy mode, this controls per-group neighbor
 computation and, when supported by Banksy, disk-backed matrix reads.
-Gram PCA in Seurat processes groups sequentially.}
+CUDA Gram PCA with disk-backed input defaults to up to eight sample
+workers, limited by the available cores and number of groups.}
 
 \item{lazy}{(boolean) If TRUE, compute PCA directly without materializing
 the full BANKSY matrix. Enables analysis of very large datasets (millions
@@ -123,8 +124,9 @@ in memory or on disk.
 \item{device}{The compute device for lazy PCA. Use \code{"cpu"} (default)
 or \code{"cuda"}. CUDA accelerates sparse matrix products for grouped
 \code{"cpp"} runs. Set \code{BANKSY_CUSPARSE_LIB} to the library path.
-For \code{"gram"}, CUDA accelerates Gram accumulation, eigendecomposition,
-and capped score projection. Set \code{BANKSY_GRAM_CUDA_LIB} to the library path.
+For \code{"gram"}, CUDA accelerates Gram accumulation and eigendecomposition.
+With capped scaling, it can also accelerate score projection and split scaling.
+Set \code{BANKSY_GRAM_CUDA_LIB} to the library path.
 Gram PCA and CUDA require a Banksy build that supports those options.}
 }
 \value{
